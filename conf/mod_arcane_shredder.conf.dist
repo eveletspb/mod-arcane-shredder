@@ -1,0 +1,39 @@
+#
+# mod-arcane-shredder configuration
+#
+
+[worldserver]
+
+# Enable the module. Reloadable. Disabling invalidates active previews.
+ArcaneShredder.Enable = 1
+
+# Maximum number of items in one preview/confirmation. Range: 1..100.
+ArcaneShredder.MaxBatchSize = 25
+
+# Preview token lifetime in seconds. Range: 5..300.
+ArcaneShredder.PreviewLifetimeSeconds = 30
+
+# Minimum delay between state-changing protocol requests. Range: 0..5000.
+ArcaneShredder.CommandCooldownMilliseconds = 500
+
+# Permit preview/confirmation while the player is in combat.
+ArcaneShredder.AllowInCombat = 0
+
+# Server-side quality caps. Uncommon items are always permitted.
+ArcaneShredder.AllowRare = 1
+ArcaneShredder.AllowEpic = 0
+
+# High-risk item states. Keep disabled unless players explicitly expect them.
+ArcaneShredder.AllowRefundable = 0
+ArcaneShredder.AllowBopTradeable = 0
+ArcaneShredder.AllowEnchanted = 0
+ArcaneShredder.AllowSocketed = 0
+
+# Global item-level cap. 0 disables the cap. Range: 0..284.
+ArcaneShredder.MaxItemLevel = 0
+
+# Comma-separated item entry deny-list. Invalid entries are ignored with a warning.
+ArcaneShredder.ProtectedItemIds = ""
+
+# Write one summary log line for every confirmed batch.
+ArcaneShredder.AuditLog = 1

@@ -1,0 +1,4 @@
+docs/
+.agents/skills/arcane-shredder-project/
+__pycache__/
+*.pyc
