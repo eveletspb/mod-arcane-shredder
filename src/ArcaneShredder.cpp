@@ -36,7 +36,8 @@ using namespace Acore::ChatCommands;
 namespace
 {
 constexpr uint32 DisenchantSpellId = 13262;
-constexpr uint32 ProtocolVersion = 1;
+constexpr uint32 PickLockSpellId = 1804;
+constexpr uint32 ProtocolVersion = 2;
 constexpr uint32 AllowedQualityMask = (1u << ITEM_QUALITY_UNCOMMON) | (1u << ITEM_QUALITY_RARE) | (1u << ITEM_QUALITY_EPIC);
 constexpr uint32 AllowedBindingMask = 0x03;
 constexpr uint32 AllowedBagMask = 0x1F;
@@ -249,6 +250,8 @@ enum class EligibilityReason
     QualityBlocked,
     ClassBlocked,
     SkillTooLow,
+    NotLockbox,
+    AlreadyOpen,
     NoLootTemplate,
     Protected,
     ItemLevelBlocked,
@@ -303,6 +306,10 @@ char const* ReasonCode(EligibilityReason reason)
         return "CLASS_BLOCKED";
     case EligibilityReason::SkillTooLow:
         return "SKILL_TOO_LOW";
+    case EligibilityReason::NotLockbox:
+        return "NOT_LOCKBOX";
+    case EligibilityReason::AlreadyOpen:
+        return "ALREADY_OPEN";
     case EligibilityReason::NoLootTemplate:
         return "NO_LOOT_TEMPLATE";
     case EligibilityReason::Protected:
@@ -332,6 +339,12 @@ struct PreviewFilter
     uint32 bagMask = 0;
 };
 
+enum class PreviewMode
+{
+    Disenchant,
+    Open
+};
+
 struct CandidateSnapshot
 {
     ObjectGuid itemGuid;
@@ -349,6 +362,7 @@ struct PreviewSession
     ObjectGuid::LowType ownerGuid = 0;
     std::string token;
     PreviewFilter filter;
+    PreviewMode mode = PreviewMode::Disenchant;
     std::chrono::steady_clock::time_point expiresAt;
     std::vector<CandidateSnapshot> candidates;
 };
@@ -413,7 +427,7 @@ bool HasDisenchantEffect()
         spellInfo->Effects.begin(), spellInfo->Effects.end(), [](SpellEffectInfo const& effect) { return effect.Effect == SPELL_EFFECT_DISENCHANT; });
 }
 
-EligibilityReason ValidatePlayer(Player const* player)
+EligibilityReason ValidatePlayer(Player const* player, PreviewMode mode)
 {
     if (!player || !player->IsInWorld())
         return EligibilityReason::PlayerUnavailable;
@@ -421,17 +435,30 @@ EligibilityReason ValidatePlayer(Player const* player)
         return EligibilityReason::PlayerDead;
     if (player->IsInCombat() && !ArcaneShredderConfig::Instance().AllowInCombat())
         return EligibilityReason::InCombat;
-    if (!player->HasSpell(DisenchantSpellId) || !HasDisenchantEffect())
-        return EligibilityReason::SpellMissing;
-    if (!player->HasSkill(SKILL_ENCHANTING))
-        return EligibilityReason::SkillMissing;
+    if (mode == PreviewMode::Disenchant)
+    {
+        if (!player->HasSpell(DisenchantSpellId) || !HasDisenchantEffect())
+            return EligibilityReason::SpellMissing;
+        if (!player->HasSkill(SKILL_ENCHANTING))
+            return EligibilityReason::SkillMissing;
+    }
+    else
+    {
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(PickLockSpellId);
+        if (!player->HasSpell(PickLockSpellId) || !spell ||
+            std::none_of(spell->Effects.begin(), spell->Effects.end(), [](SpellEffectInfo const& effect)
+            { return effect.Effect == SPELL_EFFECT_OPEN_LOCK && effect.MiscValue == LOCKTYPE_PICKLOCK; }))
+            return EligibilityReason::SpellMissing;
+        if (!player->HasSkill(SKILL_LOCKPICKING))
+            return EligibilityReason::SkillMissing;
+    }
 
     return EligibilityReason::Eligible;
 }
 
-EligibilityReason ValidateItem(Player const* player, Item const* item, PreviewFilter const& filter)
+EligibilityReason ValidateItem(Player const* player, Item const* item, PreviewFilter const& filter, PreviewMode mode)
 {
-    EligibilityReason playerReason = ValidatePlayer(player);
+    EligibilityReason playerReason = ValidatePlayer(player, mode);
     if (playerReason != EligibilityReason::Eligible)
         return playerReason;
     if (!item)
@@ -465,23 +492,44 @@ EligibilityReason ValidateItem(Player const* player, Item const* item, PreviewFi
     ItemTemplate const* itemTemplate = item->GetTemplate();
     if (!itemTemplate)
         return EligibilityReason::TemplateMissing;
-    if (itemTemplate->Quality < ITEM_QUALITY_UNCOMMON || itemTemplate->Quality > ITEM_QUALITY_EPIC)
-        return EligibilityReason::QualityBlocked;
-    if ((filter.qualityMask & (1u << itemTemplate->Quality)) == 0)
-        return EligibilityReason::QualityBlocked;
-    if (itemTemplate->Quality == ITEM_QUALITY_RARE && !config.AllowRare())
-        return EligibilityReason::QualityBlocked;
-    if (itemTemplate->Quality == ITEM_QUALITY_EPIC && !config.AllowEpic())
-        return EligibilityReason::QualityBlocked;
-    if (itemTemplate->Class != ITEM_CLASS_WEAPON && itemTemplate->Class != ITEM_CLASS_ARMOR)
-        return EligibilityReason::ClassBlocked;
-    if (itemTemplate->RequiredDisenchantSkill == uint32(-1) || itemTemplate->RequiredDisenchantSkill > player->GetSkillValue(SKILL_ENCHANTING))
-        return EligibilityReason::SkillTooLow;
-    if (!itemTemplate->DisenchantID || !LootTemplates_Disenchant.HaveLootFor(itemTemplate->DisenchantID))
-        return EligibilityReason::NoLootTemplate;
+    if (mode == PreviewMode::Disenchant)
+    {
+        if (itemTemplate->Quality < ITEM_QUALITY_UNCOMMON || itemTemplate->Quality > ITEM_QUALITY_EPIC)
+            return EligibilityReason::QualityBlocked;
+        if ((filter.qualityMask & (1u << itemTemplate->Quality)) == 0)
+            return EligibilityReason::QualityBlocked;
+        if (itemTemplate->Quality == ITEM_QUALITY_RARE && !config.AllowRare())
+            return EligibilityReason::QualityBlocked;
+        if (itemTemplate->Quality == ITEM_QUALITY_EPIC && !config.AllowEpic())
+            return EligibilityReason::QualityBlocked;
+        if (itemTemplate->Class != ITEM_CLASS_WEAPON && itemTemplate->Class != ITEM_CLASS_ARMOR)
+            return EligibilityReason::ClassBlocked;
+        if (itemTemplate->RequiredDisenchantSkill == uint32(-1) || itemTemplate->RequiredDisenchantSkill > player->GetSkillValue(SKILL_ENCHANTING))
+            return EligibilityReason::SkillTooLow;
+        if (!itemTemplate->DisenchantID || !LootTemplates_Disenchant.HaveLootFor(itemTemplate->DisenchantID))
+            return EligibilityReason::NoLootTemplate;
+    }
+    else
+    {
+        if (!itemTemplate->HasFlag(ITEM_FLAG_HAS_LOOT) || !itemTemplate->LockID || !item->IsLocked())
+            return item->IsLocked() ? EligibilityReason::NotLockbox : EligibilityReason::AlreadyOpen;
+        LockEntry const* lock = sLockStore.LookupEntry(itemTemplate->LockID);
+        if (!lock)
+            return EligibilityReason::NotLockbox;
+        bool pickable = false;
+        for (uint8 index = 0; index < MAX_LOCK_CASE; ++index)
+        {
+            if (lock->Type[index] == LOCK_KEY_SKILL && lock->Index[index] == LOCKTYPE_PICKLOCK
+                && player->GetSkillValue(SKILL_LOCKPICKING) >= lock->Skill[index])
+                pickable = true;
+        }
+        if (!pickable)
+            return EligibilityReason::SkillTooLow;
+    }
     if (config.IsProtected(itemTemplate->ItemId))
         return EligibilityReason::Protected;
-    if ((config.MaxItemLevel() && itemTemplate->ItemLevel > config.MaxItemLevel()) || (filter.maxItemLevel && itemTemplate->ItemLevel > filter.maxItemLevel))
+    if ((config.MaxItemLevel() && itemTemplate->ItemLevel > config.MaxItemLevel())
+        || (mode == PreviewMode::Disenchant && filter.maxItemLevel && itemTemplate->ItemLevel > filter.maxItemLevel))
         return EligibilityReason::ItemLevelBlocked;
 
     uint32 bindingBit = item->IsSoulBound() ? 0x02 : 0x01;
@@ -540,7 +588,7 @@ public:
         return instance;
     }
 
-    bool CreatePreview(Player* player, PreviewFilter const& filter, PreviewSession& result, uint32& total, std::string& error)
+    bool CreatePreview(Player* player, PreviewFilter const& filter, PreviewMode mode, PreviewSession& result, uint32& total, std::string& error)
     {
         if (!ValidateFilter(filter, error))
             return false;
@@ -549,7 +597,7 @@ public:
         if (IsExecuting(player, error))
             return false;
 
-        EligibilityReason reason = ValidatePlayer(player);
+        EligibilityReason reason = ValidatePlayer(player, mode);
         if (reason != EligibilityReason::Eligible)
         {
             error = ReasonCode(reason);
@@ -562,7 +610,7 @@ public:
 
         auto consider = [&](Item* item)
         {
-            if (ValidateItem(player, item, filter) != EligibilityReason::Eligible)
+            if (ValidateItem(player, item, filter, mode) != EligibilityReason::Eligible)
                 return;
 
             ++total;
@@ -593,6 +641,7 @@ public:
         result.ownerGuid = player->GetGUID().GetCounter();
         result.token = GenerateToken();
         result.filter = filter;
+        result.mode = mode;
         result.expiresAt = std::chrono::steady_clock::now() + std::chrono::seconds(ArcaneShredderConfig::Instance().PreviewLifetimeSeconds());
         result.candidates = std::move(candidates);
 
@@ -645,12 +694,6 @@ public:
 
     bool Consume(Player* player, std::string const& token, PreviewSession& result, std::string& error)
     {
-        EligibilityReason reason = ValidatePlayer(player);
-        if (reason != EligibilityReason::Eligible)
-        {
-            error = ReasonCode(reason);
-            return false;
-        }
         if (!CheckCooldown(player, error))
             return false;
 
@@ -664,6 +707,12 @@ public:
         PreviewSession* session = FindActiveSession(player, token, error);
         if (!session)
             return false;
+        EligibilityReason reason = ValidatePlayer(player, session->mode);
+        if (reason != EligibilityReason::Eligible)
+        {
+            error = ReasonCode(reason);
+            return false;
+        }
 
         result = std::move(*session);
         _previews.erase(playerGuid);
@@ -843,7 +892,8 @@ bool RequireEnabled(ChatHandler* handler)
 void SendPreview(ChatHandler* handler, PreviewSession const& session, uint32 total)
 {
     uint32 ttl = ArcaneShredderConfig::Instance().PreviewLifetimeSeconds();
-    SendProtocol(handler, Acore::StringFormat("ASHRED:BEGIN:{}:{}:{}", session.token, ttl, session.candidates.size()));
+    SendProtocol(handler, Acore::StringFormat("ASHRED:BEGIN:{}:{}:{}:{}", session.token, ttl, session.candidates.size(),
+        session.mode == PreviewMode::Open ? "OPEN" : "DISENCHANT"));
     if (total > session.candidates.size())
         SendProtocol(handler, Acore::StringFormat("ASHRED:WARN:TRUNCATED:{}:{}", total, session.candidates.size()));
 
@@ -857,14 +907,34 @@ void SendPreview(ChatHandler* handler, PreviewSession const& session, uint32 tot
     SendProtocol(handler, Acore::StringFormat("ASHRED:END:{}:{}", session.token, session.candidates.size()));
 }
 
-EligibilityReason ExecuteDisenchant(Player* player, CandidateSnapshot const& candidate, PreviewFilter const& filter, uint32& mailed)
+EligibilityReason ExecuteItem(Player* player, CandidateSnapshot const& candidate, PreviewSession const& session, uint32& mailed)
 {
     Item* sourceItem = player->GetItemByGuid(candidate.itemGuid);
-    EligibilityReason reason = ValidateItem(player, sourceItem, filter);
+    EligibilityReason reason = ValidateItem(player, sourceItem, session.filter, session.mode);
     if (reason == EligibilityReason::Eligible && !MatchesSnapshot(sourceItem, candidate))
         reason = EligibilityReason::ItemChanged;
     if (reason != EligibilityReason::Eligible)
         return reason;
+
+    if (session.mode == PreviewMode::Open)
+    {
+        LockEntry const* lock = sLockStore.LookupEntry(sourceItem->GetTemplate()->LockID);
+        uint32 requiredSkill = 0;
+        for (uint8 index = 0; index < MAX_LOCK_CASE; ++index)
+        {
+            if (lock->Type[index] == LOCK_KEY_SKILL && lock->Index[index] == LOCKTYPE_PICKLOCK
+                && player->GetSkillValue(SKILL_LOCKPICKING) >= lock->Skill[index])
+            {
+                requiredSkill = lock->Skill[index];
+                break;
+            }
+        }
+
+        sourceItem->SetFlag(ITEM_FIELD_FLAGS, ITEM_FIELD_FLAG_UNLOCKED);
+        sourceItem->SetState(ITEM_CHANGED, player);
+        player->UpdateGatherSkill(SKILL_LOCKPICKING, player->GetPureSkillValue(SKILL_LOCKPICKING), requiredSkill);
+        return EligibilityReason::Eligible;
+    }
 
     ItemTemplate const* sourceTemplate = sourceItem->GetTemplate();
     Loot loot;
@@ -888,7 +958,7 @@ EligibilityReason ExecuteDisenchant(Player* player, CandidateSnapshot const& can
     // Loot generation does not mutate the item, but scripts may run around this
     // command. Resolve and validate it once more at the destructive boundary.
     sourceItem = player->GetItemByGuid(candidate.itemGuid);
-    reason = ValidateItem(player, sourceItem, filter);
+    reason = ValidateItem(player, sourceItem, session.filter, session.mode);
     if (reason == EligibilityReason::Eligible && !MatchesSnapshot(sourceItem, candidate))
         reason = EligibilityReason::ItemChanged;
     if (reason != EligibilityReason::Eligible)
@@ -950,7 +1020,7 @@ ExecutionSummary ExecutePreview(ChatHandler* handler, Player* player, PreviewSes
     for (CandidateSnapshot const& candidate : session.candidates)
     {
         uint32 mailedBefore = summary.mailed;
-        EligibilityReason reason = ExecuteDisenchant(player, candidate, session.filter, summary.mailed);
+        EligibilityReason reason = ExecuteItem(player, candidate, session, summary.mailed);
         if (reason != EligibilityReason::Eligible)
         {
             ++summary.skipped;
@@ -959,7 +1029,7 @@ ExecutionSummary ExecutePreview(ChatHandler* handler, Player* player, PreviewSes
             if (reason == EligibilityReason::DeliveryFailed)
             {
                 LOG_ERROR("module",
-                    "ArcaneShredder: loot generation failed for player {} item {} "
+                    "ArcaneShredder: loot delivery failed for player {} item {} "
                     "guid {}. Source item retained.",
                     player->GetGUID().ToString(), candidate.entry, candidate.itemGuid.ToString());
             }
@@ -977,7 +1047,7 @@ bool HandleHelloCommand(ChatHandler* handler, uint32 clientProtocol)
     if (!RequireMachineHandler(handler) || !RequireEnabled(handler))
         return true;
 
-    SendProtocol(handler, Acore::StringFormat("ASHRED:HELLO:{}:PREVIEW,EXCLUDE,CONFIRM,CANCEL,MAIL", ProtocolVersion));
+    SendProtocol(handler, Acore::StringFormat("ASHRED:HELLO:{}:PREVIEW,OPEN,EXCLUDE,CONFIRM,CANCEL,MAIL", ProtocolVersion));
     if (clientProtocol != ProtocolVersion)
         return SendFailure(handler, "PROTOCOL_MISMATCH");
     return true;
@@ -992,7 +1062,23 @@ bool HandlePreviewCommand(ChatHandler* handler, uint32 qualityMask, uint32 maxIt
     PreviewSession session;
     uint32 total = 0;
     std::string error;
-    if (!ArcaneShredderService::Instance().CreatePreview(handler->GetPlayer(), filter, session, total, error))
+    if (!ArcaneShredderService::Instance().CreatePreview(handler->GetPlayer(), filter, PreviewMode::Disenchant, session, total, error))
+        return SendFailure(handler, error);
+
+    SendPreview(handler, session, total);
+    return true;
+}
+
+bool HandleOpenPreviewCommand(ChatHandler* handler, uint32 bindingMask, uint32 bagMask)
+{
+    if (!RequireMachineHandler(handler) || !RequireEnabled(handler))
+        return true;
+
+    PreviewFilter filter { 0, 0, bindingMask, bagMask };
+    PreviewSession session;
+    uint32 total = 0;
+    std::string error;
+    if (!ArcaneShredderService::Instance().CreatePreview(handler->GetPlayer(), filter, PreviewMode::Open, session, total, error))
         return SendFailure(handler, error);
 
     SendPreview(handler, session, total);
@@ -1043,9 +1129,10 @@ bool HandleConfirmCommand(ChatHandler* handler, std::string token)
     if (ArcaneShredderConfig::Instance().AuditLog())
     {
         LOG_INFO("module",
-            "ArcaneShredder: player={} ({}) token={} preview={} completed={} "
+            "ArcaneShredder: player={} ({}) mode={} token={} preview={} completed={} "
             "skipped={} mailed={}",
-            handler->GetPlayer()->GetName(), handler->GetPlayer()->GetGUID().ToString(), token, session.candidates.size(), summary.completed, summary.skipped,
+            handler->GetPlayer()->GetName(), handler->GetPlayer()->GetGUID().ToString(),
+            session.mode == PreviewMode::Open ? "open" : "disenchant", token, session.candidates.size(), summary.completed, summary.skipped,
             summary.mailed);
     }
     return true;
@@ -1064,7 +1151,7 @@ bool HandleStatusCommand(ChatHandler* handler)
                                  "activePreview={}, protocol={}",
             enabled, addonChannel, hasPreview, ProtocolVersion);
         handler->SendSysMessage("[ArcaneShredder] Use /ashred in the client addon "
-                                "for preview and batch disenchant.");
+                                "for preview, batch disenchant, and batch lockbox unlocking.");
     }
     else
     {
@@ -1116,6 +1203,7 @@ public:
     {
         static std::vector<ChatCommandBuilder> subCommands
             = { { "hello", HandleHelloCommand, SEC_PLAYER, Console::No }, { "preview", HandlePreviewCommand, SEC_PLAYER, Console::No },
+                  { "openpreview", HandleOpenPreviewCommand, SEC_PLAYER, Console::No },
                   { "exclude", HandleExcludeCommand, SEC_PLAYER, Console::No }, { "cancel", HandleCancelCommand, SEC_PLAYER, Console::No },
                   { "confirm", HandleConfirmCommand, SEC_PLAYER, Console::No }, { "status", HandleStatusCommand, SEC_PLAYER, Console::No } };
 

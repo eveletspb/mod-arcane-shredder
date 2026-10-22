@@ -30,6 +30,7 @@ class ProtocolContractTest(unittest.TestCase):
         for handler in (
             "HandleHelloCommand",
             "HandlePreviewCommand",
+            "HandleOpenPreviewCommand",
             "HandleExcludeCommand",
             "HandleCancelCommand",
             "HandleConfirmCommand",
@@ -37,6 +38,25 @@ class ProtocolContractTest(unittest.TestCase):
             start = SERVER.index(f"bool {handler}")
             end = SERVER.index("\n}\n", start)
             self.assertIn("RequireMachineHandler(handler)", SERVER[start:end])
+
+    def test_lockboxes_require_native_pick_lock_skill_and_own_preview(self):
+        self.assertIn("player->HasSpell(PickLockSpellId)", SERVER)
+        self.assertIn("player->HasSkill(SKILL_LOCKPICKING)", SERVER)
+        self.assertIn("player->GetSkillValue(SKILL_LOCKPICKING) >= lock->Skill[index]", SERVER)
+        self.assertIn("itemTemplate->HasFlag(ITEM_FLAG_HAS_LOOT)", SERVER)
+        self.assertIn("session.mode == PreviewMode::Open", SERVER)
+        self.assertIn('"openpreview", HandleOpenPreviewCommand', SERVER)
+
+    def test_unlocking_keeps_lockboxes_and_does_not_generate_loot(self):
+        start = SERVER.index("if (session.mode == PreviewMode::Open)", SERVER.index("EligibilityReason ExecuteItem"))
+        end = SERVER.index("ItemTemplate const* sourceTemplate", start)
+        unlock = SERVER[start:end]
+        self.assertIn("sourceItem->SetFlag(ITEM_FIELD_FLAGS, ITEM_FIELD_FLAG_UNLOCKED)", unlock)
+        self.assertIn("sourceItem->SetState(ITEM_CHANGED, player)", unlock)
+        self.assertIn("player->UpdateGatherSkill(SKILL_LOCKPICKING", unlock)
+        self.assertIn("return EligibilityReason::Eligible", unlock)
+        self.assertNotIn("FillLoot", unlock)
+        self.assertNotIn("DestroyItem", unlock)
 
     def test_largest_item_record_fits_azerothcore_addon_envelope(self):
         record = (
